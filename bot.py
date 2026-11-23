@@ -18,6 +18,8 @@ bindings = {}
 
 TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 
+MAX_FILE_SIZE = 8 * 1024 * 1024  # 8 МБ — больше Discord у обычных ботов не примет
+
 
 async def google_translate(text: str, dest: str = "ru"):
     """Перевод через бесплатный эндпоинт Google. Возвращает None, если сервис недоступен."""
@@ -35,6 +37,24 @@ async def google_translate(text: str, dest: str = "ru"):
         return result if result.strip() else None
     except Exception as err:
         print(f"⚠️ Ошибка перевода: {err}")
+        return None
+
+
+async def download_file(url: str):
+    """Скачивает вложение и возвращает discord.File. None — если не удалось."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.read()
+        if len(data) > MAX_FILE_SIZE:
+            return None
+        filename = url.split("/")[-1].split("?")[0] or "file.png"
+        return discord.File(io_bytes := __import__("io").BytesIO(data), filename=filename)
+    except Exception as err:
+        print(f"⚠️ Не удалось скачать файл {url}: {err}")
         return None
 
 
@@ -219,23 +239,40 @@ async def on_message(message: discord.Message):
             ne.add_field(name=name, value=value, inline=f.inline)
         if e.footer and e.footer.text:
             ne.set_footer(text=await google_translate(e.footer.text) or e.footer.text)
+        if e.image and e.image.url:
+            ne.set_image(url=e.image.url)
+        if e.thumbnail and e.thumbnail.url:
+            ne.set_thumbnail(url=e.thumbnail.url)
         if e.url:
             ne.url = e.url
         if e.color:
             ne.color = e.color
         new_embeds.append(ne)
 
-    # картинки и файлы — копируем ссылками
-    attachments_text = "\n".join(a.url for a in message.attachments)
+    # скачиваем картинки и файлы из source, чтобы отправить их в target по-настоящему
+    files = []
+    failed_urls = []
+    for att in message.attachments[:5]:
+        f = await download_file(att.url)
+        if f is not None:
+            files.append(f)
+        else:
+            failed_urls.append(att.url)
 
     try:
         if translated:
-            for part in chunk_text(translated):
+            parts = chunk_text(translated)
+            # первую часть отправляем вместе с файлами — так Discord покажет картинки
+            first = parts.pop(0)
+            await target.send(content=first, files=files or None)
+            for part in parts:
                 await target.send(content=part)
+        elif files:
+            await target.send(files=files)
         if new_embeds:
             await target.send(embeds=new_embeds)
-        if attachments_text and not translated and not new_embeds:
-            await target.send(content=attachments_text)
+        if failed_urls:
+            await target.send(content="📎 " + "\n".join(failed_urls))
     except discord.Forbidden:
         print(f"❌ Нет прав писать в канал #{target.name}")
     except Exception as err:
