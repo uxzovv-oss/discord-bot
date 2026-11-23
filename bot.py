@@ -1,413 +1,299 @@
 # -*- coding: utf-8 -*-
 """
-Discord-бот: автоматический перевод новостей EN -> RU.
+Discord-бот: переводчик новостей.
+Берёт сообщения из канала-источника (source), переводит их на русский
+и отправляет в целевой канал (target).
 
-Что делает:
-  • Слушает промежуточный канал (куда Discord пересылает новости подпиской
-    на чужой канал объявлений). Вебхуки НЕ игнорируются.
-  • Переводит текст (content + embed-карточки) на русский через deep-translator.
-  • Отправляет в основной канал: перевод + та же картинка (из embed по URL
-    или вложением, скачанным ботом).
-  • Выдаёт владельцу (OWNER_ID) роль «Высшая админка» на своём сервере.
-  • /bind — привязать каналы, /check — проверить коннект, /translate — тест.
+Перевод работает напрямую через бесплатный эндпоинт Google Translate
+(без сторонних библиотек-обёрток — только aiohttp, который уже есть в discord.py).
+
+Токен берётся из переменной окружения DISCORD_TOKEN (задаётся на хостинге).
 """
 
-import json
-import logging
 import os
-import time
-import deep_translator
-print("✅ deep_translator найден:", deep_translator.__version__)
+import json
+import re
+import aiohttp
 import discord
 from discord import app_commands
-from deep_translator import GoogleTranslator
 
-# ════════════════════════ НАСТРОЙКИ ════════════════════════
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
+CONFIG_PATH = "bindings.json"
 
-TOKEN = os.getenv("DISCORD_TOKEN", "")
-
-OWNER_ID = 1411647769084563458          # твой ID — высшая админка
-ADMIN_ROLE_NAME = "Высшая админка"      # роль, которую бот выдаст тебе
-
-# Промежуточный канал НА ТВОЁМ сервере (куда приходит подписка с новостями).
-# УЗНАЙ ЕГО ID: правый клик по каналу -> «Копировать ID канала», и впиши сюда.
-SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID", "0"))
-
-# Основной канал, куда бот отправляет перевод.
-TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID", "1566145147111219281"))
-
-CONFIG_FILE = "config.json"
-TRANSLATE_RETRIES = 3
-RETRY_DELAY_SEC = 3
-DISCORD_LIMIT = 2000
-MAX_EMBEDS = 10
-
-# ════════════════════════ ЛОГИРОВАНИЕ ════════════════════════
-
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("news-translator")
-
-translator = GoogleTranslator(source="auto", target="ru")
-
-# ════════════════════════ КОНФИГ (переживает рестарт) ════════════════════════
-
-config: dict = {"source_id": SOURCE_CHANNEL_ID, "target_id": TARGET_CHANNEL_ID}
-
-def load_config():
-    global config
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        config["source_id"] = int(data.get("source_id", SOURCE_CHANNEL_ID))
-        config["target_id"] = int(data.get("target_id", TARGET_CHANNEL_ID))
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        pass
-
-def save_config():
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-
-# ════════════════════════ КЛИЕНТ ════════════════════════
+GOOGLE_URL = "https://translate.googleapis.com/translate_a/single"
 
 intents = discord.Intents.default()
-intents.message_content = True   # ОБЯЗАТЕЛЬНО: иначе текст сообщений пустой
+intents.message_content = True
 intents.guilds = True
-intents.members = True           # чтобы находить тебя и выдать роль
 
-bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
-# ════════════════════════ ТЕКСТ И ПЕРЕВОД ════════════════════════
+http_session: aiohttp.ClientSession = None
+translator_ok = True  # жив ли переводчик по последней проверке
 
-def split_text(text: str, limit: int) -> list:
-    """Режет текст на куски не длиннее limit, не рвя слова."""
+
+# ---------------- Конфигурация привязок ----------------
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_config(cfg: dict) -> None:
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+config = load_config()
+
+
+# ---------------- Перевод ----------------
+
+def _split_chunks(text: str, limit: int = 1900) -> list:
+    """Режет длинный текст на куски меньше лимита Discord."""
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        # ищем ближайший перенос строки или пробел, чтобы не резать слово
+        cut = text.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = text.rfind(" ", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip()
+    return chunks
+
+
+async def translate_text(text: str) -> tuple:
+    """
+    Переводит текст на русский.
+    Возвращает (результат, успех).
+    Если текст уже на русском или без букв — возвращает как есть.
+    Если сервис недоступен — возвращает оригинал и False.
+    """
+    global translator_ok
+    text = (text or "").strip()
     if not text:
-        return []
-    pieces = []
-    for block in text.split("\n"):
-        while len(block) > limit:
-            cut = block.rfind(" ", 0, limit)
-            if cut <= 0:
-                cut = limit
-            pieces.append(block[:cut].rstrip())
-            block = block[cut:].lstrip()
-        if block:
-            pieces.append(block)
-    messages, current = [], ""
-    for piece in pieces:
-        if current and len(current) + len(piece) + 1 <= limit:
-            current += "\n" + piece
-        elif current:
-            messages.append(current)
-            current = piece
-        else:
-            current = piece
-    if current:
-        messages.append(current)
-    return messages
-
-def is_mostly_russian(text: str) -> bool:
-    letters = [c for c in text if c.isalpha()]
-    if not letters:
-        return False
-    cyrillic = sum(1 for c in letters if "а" <= c.lower() <= "я")
-    return cyrillic / len(letters) > 0.3
-
-def translate_text(text: str):
-    """Перевод с повторами при сбоях. None — если не удалось вовсе."""
-    if not text or not text.strip():
-        return text
-    parts = []
-    for chunk in split_text(text, 4500):
-        for attempt in range(1, TRANSLATE_RETRIES + 1):
-            try:
-                result = translator.translate(chunk)
-                if result is None or not result.strip():
-                    raise ValueError("Пустой ответ переводчика")
-                parts.append(result)
-                break
-            except Exception as e:
-                log.warning("Попытка перевода %d/%d: %s", attempt, TRANSLATE_RETRIES, e)
-                if attempt < TRANSLATE_RETRIES:
-                    time.sleep(RETRY_DELAY_SEC * attempt)
-                else:
-                    return None
-    return "\n".join(parts)
-
-def safe_translate(text: str) -> str:
-    """Никогда не падает: при ошибке вернёт оригинал."""
+        return text, True
+    # нет латиницы/иероглифов — переводить нечего (уже русский)
+    if not re.search(r"[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u4E00-\u9FFF\u3040-\u30FF]", text):
+        return text, True
     try:
-        translated = translate_text(text)
-        if translated and translated.strip():
-            return translated
+        params = {"client": "gtx", "sl": "auto", "tl": "ru", "dt": "t", "q": text}
+        async with http_session.get(GOOGLE_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            resp.raise_for_status()
+            data = await resp.json(content_type=None)
+        translated = "".join(part[0] for part in (data[0] or []) if part and part[0])
+        if translated:
+            translator_ok = True
+            return translated, True
+        return text, False
     except Exception:
-        log.exception("Непредвиденная ошибка перевода")
-    return text
+        translator_ok = False
+        return text, False
 
-def extract_text(message: discord.Message) -> str:
-    """Весь текст: content + все embed-карточки."""
-    parts = []
-    if message.content.strip():
-        parts.append(message.content.strip())
-    for embed in message.embeds:
-        lines = []
-        if embed.author and embed.author.name:
-            lines.append(embed.author.name)
-        if embed.title:
-            lines.append(embed.title)
-        if embed.description:
-            lines.append(embed.description)
-        for field in embed.fields:
-            if field.name:
-                lines.append(field.name)
-            if field.value:
-                lines.append(field.value)
-        if embed.footer and embed.footer.text:
-            lines.append(embed.footer.text)
-        if lines:
-            parts.append("\n".join(lines))
-    return "\n\n".join(parts)
 
-def extract_text_of_embed(embed: discord.Embed) -> str:
-    lines = []
-    if embed.title:
-        lines.append(embed.title)
-    if embed.description:
-        lines.append(embed.description)
-    for field in embed.fields:
-        if field.name:
-            lines.append(field.name)
-        if field.value:
-            lines.append(field.value)
-    return "\n".join(lines)
+def _truncate(s: str, limit: int) -> str:
+    if s is None:
+        return None
+    return s if len(s) <= limit else s[: limit - 1] + "…"
 
-# ════════════════════════ ОТПРАВКА ════════════════════════
 
-async def send_chunks(target, text: str, files):
-    chunks = split_text(text, DISCORD_LIMIT)
-    for i, chunk in enumerate(chunks):
-        await target.send(chunk,
-                          files=files if i == 0 else None,
-                          allowed_mentions=discord.AllowedMentions.none())
-        files = None
+# ---------------- Пересылка сообщения ----------------
 
-async def send_translated_embeds(message: discord.Message, target, files):
-    """Пересобирает карточки с переводом. Картинки — те же (по URL)."""
-    extra_text = []
-    first = True
-    for original in message.embeds[:MAX_EMBEDS]:
-        try:
-            t_title = safe_translate(original.title) if original.title else ""
-            t_desc = safe_translate(original.description) if original.description else ""
-            embed = discord.Embed(title=t_title[:256] or None,
-                                  description=t_desc[:4096] or None)
-            if len(t_desc) > 4096:
-                extra_text.append(t_desc[4096:])
-            if original.url:
-                embed.url = original.url
-            if original.color is not None:
-                embed.color = original.color
-            if original.image:
-                embed.set_image(url=original.image.url)      # та же картинка
-            if original.thumbnail:
-                embed.set_thumbnail(url=original.thumbnail.url)
-            if original.author and original.author.name:
-                embed.set_author(name=safe_translate(original.author.name)[:256],
-                                 url=original.author.url,
-                                 icon_url=original.author.icon_url)
-            if original.footer and original.footer.text:
-                embed.set_footer(text=safe_translate(original.footer.text)[:2048])
-            for field in original.fields[:25]:
-                name = safe_translate(field.name)[:256] if field.name else "\u200b"
-                value = safe_translate(field.value)[:1024] if field.value else "\u200b"
-                embed.add_field(name=name, value=value, inline=field.inline)
-            await target.send(embed=embed, files=files if first else None,
-                              allowed_mentions=discord.AllowedMentions.none())
-            first = False
-        except Exception:
-            log.exception("Не удалось пересобрать embed, отправляю текстом")
-            await send_chunks(target, safe_translate(extract_text_of_embed(original)),
-                              files if first else [])
-            first = False
-    content = message.content.strip()
-    if content:
-        duplicated = any(content in (e.description or "") or content in (e.title or "")
-                         for e in message.embeds)
-        if not duplicated:
-            await send_chunks(target, safe_translate(content), files if first else [])
-            first = False
-    for part in extra_text:
-        await send_chunks(target, safe_translate(part), [])
+async def rebuild_embed(message: discord.Message) -> list:
+    """Переводит текстовые поля embed-карточек и возвращает список новых embed-ов."""
+    result = []
+    for emb in message.embeds:
+        e = discord.Embed()
+        if emb.title:
+            t, _ = await translate_text(emb.title)
+            e.title = _truncate(t, 256)
+        if emb.description:
+            d, _ = await translate_text(emb.description)
+            e.description = _truncate(d, 4000)
+        if emb.url:
+            e.url = emb.url
+        for field in emb.fields:
+            fname, _ = await translate_text(field.name)
+            fvalue, _ = await translate_text(field.value)
+            e.add_field(name=_truncate(fname, 256), value=_truncate(fvalue, 1000), inline=field.inline)
+        if emb.footer and emb.footer.text:
+            ft, _ = await translate_text(emb.footer.text)
+            e.set_footer(text=_truncate(ft, 200))
+            if emb.footer.icon_url:
+                e.set_footer(text=_truncate(ft, 200), icon_url=emb.footer.icon_url)
+        if emb.author:
+            if emb.author.name:
+                an, _ = await translate_text(emb.author.name)
+                e.set_author(name=_truncate(an, 256), url=emb.author.url, icon_url=emb.author.icon_url)
+        if emb.image and emb.image.url:
+            e.set_image(url=emb.image.url)
+        if emb.thumbnail and emb.thumbnail.url:
+            e.set_thumbnail(url=emb.thumbnail.url)
+        if emb.colour:
+            e.colour = emb.colour
+        result.append(e)
+    return result
 
-async def process_news(message: discord.Message):
-    """Главная обработка одной новости."""
-    target = bot.get_channel(config["target_id"])
+
+async def forward_message(message: discord.Message, cfg: dict) -> None:
+    guild = message.guild
+    if not guild:
+        return
+    target = guild.get_channel(cfg.get("target_id"))
     if target is None:
-        try:
-            target = await bot.fetch_channel(config["target_id"])
-        except (discord.NotFound, discord.Forbidden):
-            target = None
-    if target is None:
-        log.warning("Основной канал (ID %s) не найден. Проверь /bind и права.",
-                    config["target_id"])
         return
 
-    raw_text = extract_text(message)
-    if not raw_text and not message.attachments and not message.embeds:
-        return  # пустое сообщение — пропускаем
+    # 1. Переводим текст сообщения
+    translated, ok = await translate_text(message.content or "")
+    prefix = "" if ok else "🌐 Переводчик недоступен — отправлен оригинал:\n"
+    who = f"**{message.author.display_name}:**\n" if message.author.display_name else ""
 
-    # Скачиваем вложения (картинки/файлы), чтобы отправить их же в перевод
-    files = []
-    for attachment in message.attachments:
-        already_in_embed = any(e.image and e.image.url == attachment.url
-                               for e in message.embeds)
-        if already_in_embed:
-            continue  # картинка уже будет в карточке — не дублируем
+    for chunk in _split_chunks(prefix + who + translated):
         try:
-            files.append(await attachment.to_file())
-        except Exception:
-            log.warning("Вложение %s не скачалось, пришлю ссылку", attachment.filename)
-            raw_text += f"\n\nВложение: {attachment.url}"
+            await target.send(chunk)
+        except discord.HTTPException:
+            pass
 
-    # Уже русский текст — просто пересылаем без перевода
-    if is_mostly_russian(raw_text):
-        if raw_text:
-            await send_chunks(target, raw_text, files)
-        elif files:
-            await target.send(files=files)
-        return
-
+    # 2. Переводим embed-карточки
     if message.embeds:
-        await send_translated_embeds(message, target, files)
-    else:
-        await send_chunks(target, safe_translate(raw_text), files)
+        embeds = await rebuild_embed(message)
+        for i in range(0, len(embeds), 10):
+            try:
+                await target.send(embeds=embeds[i:i + 10])
+            except discord.HTTPException:
+                pass
 
-    log.info("Новость (id=%s) переведена и отправлена", message.id)
+    # 3. Копируем картинки-вложения
+    image_urls = [a.url for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
+    if image_urls:
+        for i in range(0, len(image_urls), 10):
+            batch = [discord.Embed().set_image(url=u) for u in image_urls[i:i + 10]]
+            try:
+                await target.send(embeds=batch)
+            except discord.HTTPException:
+                pass
 
-# ════════════════════════ ПРАВА ════════════════════════
 
-def is_owner(user) -> bool:
-    return user.id == OWNER_ID
+# ---------------- События ----------------
 
-# ════════════════════════ КОМАНДЫ ════════════════════════
-
-@tree.command(name="bind", description="Привязать каналы (только владелец)")
-@app_commands.describe(source="Канал, откуда бот читает новости",
-                       target="Канал, куда бот отправляет перевод")
-async def bind(interaction: discord.Interaction, source: discord.TextChannel,
-               target: discord.TextChannel):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("⛔ Только владелец бота.", ephemeral=True)
-        return
-    config["source_id"] = source.id
-    config["target_id"] = target.id
-    save_config()
-    await interaction.response.send_message(
-        f"✅ Привязано!\n• Слежу за: {source.mention}\n• Отправляю в: {target.mention}",
-        ephemeral=True)
-
-@tree.command(name="check", description="Проверить коннект: Discord, переводчик, каналы")
-async def check(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    lines = []
-    latency = round(bot.latency * 1000)
-    lines.append(f"🔌 Коннект Discord: **{latency} мс** — "
-                 + ("всё хорошо" if latency < 500 else "медленно, но работает"))
-
-    src = bot.get_channel(config["source_id"])
-    tgt = bot.get_channel(config["target_id"])
-    lines.append(f"📥 Промежуточный канал: {src.mention if src else '❌ не привязан — /bind'}")
-    if isinstance(src, discord.TextChannel):
-        perms = src.permissions_for(src.guild.me)
-        lines.append(f"   └ Чтение: {'✅' if perms.view_channel else '❌ нет права View Channel'}")
-    lines.append(f"📤 Основной канал: {tgt.mention if tgt else '❌ не привязан — /bind'}")
-    if isinstance(tgt, discord.TextChannel):
-        perms = tgt.permissions_for(tgt.guild.me)
-        lines.append(f"   └ Отправка: {'✅' if perms.send_messages else '❌'}")
-        lines.append(f"   └ Вложения/карточки: "
-                     f"{'✅' if perms.attach_files and perms.embed_links else '❌'}")
-
-    test_start = time.time()
+@client.event
+async def on_ready():
+    global http_session
+    if http_session is None or http_session.closed:
+        http_session = aiohttp.ClientSession()
+    await tree.sync()
     try:
-        translated = translator.translate("Hello, this is a connection test.")
+        await client.change_presence(activity=discord.Activity(
+            type=discord.ActivityType.watching, name="за новостями"))
     except Exception:
-        translated = None
-    if translated:
-        lines.append(f"🌐 Переводчик: ✅ ({round((time.time() - test_start) * 1000)} мс), "
-                     f"тест: «{translated}»")
+        pass
+    print(f"✅ Бот запущен как {client.user} (guilds: {len(client.guilds)})")
+
+
+@client.event
+async def on_message(message: discord.Message):
+    # игнорируем собственные сообщения бота
+    if message.author.id == client.user.id:
+        return
+    cfg = config.get(str(message.guild.id)) if message.guild else None
+    if not cfg or message.channel.id != cfg.get("source_id"):
+        return
+    if message.type not in (discord.MessageType.default, discord.MessageType.news, discord.MessageType.reply):
+        return
+    await forward_message(message, cfg)
+
+
+# ---------------- Слэш-команды ----------------
+
+def is_admin(interaction: discord.Interaction) -> bool:
+    return (
+        interaction.user.guild_permissions.administrator
+        or interaction.user.id == interaction.guild.owner_id
+    )
+
+
+@tree.command(name="bind", description="Привязать каналы: source — откуда брать новости, target — куда переводить")
+@app_commands.describe(source="Канал с оригинальными новостями", target="Канал для переведённых новостей")
+async def bind(interaction: discord.Interaction, source: discord.TextChannel, target: discord.TextChannel):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Только администратор может настраивать привязку.", ephemeral=True)
+        return
+    config[str(interaction.guild_id)] = {"source_id": source.id, "target_id": target.id}
+    save_config(config)
+    await interaction.response.send_message(
+        f"✅ Привязано: `{source.name}` → `{target.name}`. Теперь сообщения из {source.mention} "
+        f"будут переводиться в {target.mention}.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="translate", description="Перевести текст на русский (тест переводчика)")
+@app_commands.describe(text="Текст для перевода")
+async def translate(interaction: discord.Interaction, text: str):
+    global http_session
+    if http_session is None or http_session.closed:
+        http_session = aiohttp.ClientSession()
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    translated, ok = await translate_text(text)
+    if ok:
+        await interaction.followup.send(f"🌐 **Перевод:**\n{translated}", ephemeral=True)
     else:
-        lines.append("🌐 Переводчик: ❌ не отвечает — переводы пойдут в оригинале")
+        await interaction.followup.send(
+            "⚠️ Переводчик недоступен (сервис не ответил). Попробуйте ещё раз через минуту.",
+            ephemeral=True,
+        )
+
+
+@tree.command(name="check", description="Проверить: права в каналах и работоспособность переводчика")
+async def check(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    lines = []
+
+    cfg = config.get(str(interaction.guild_id))
+    if not cfg:
+        lines.append("❌ Привязка не настроена — выполните `/bind`.")
+    else:
+        src = interaction.guild.get_channel(cfg.get("source_id"))
+        tgt = interaction.guild.get_channel(cfg.get("target_id"))
+        me = interaction.guild.me
+
+        if src is None:
+            lines.append("❌ Канал-источник (source) не найден.")
+        else:
+            perms = src.permissions_for(me)
+            lines.append(f"{'✅' if perms.view_channel and perms.read_message_history else '❌'} "
+                         f"Источник {src.mention}: вижу {'да' if perms.view_channel and perms.read_message_history else 'НЕТ'}")
+
+        if tgt is None:
+            lines.append("❌ Целевой канал (target) не найден.")
+        else:
+            perms = tgt.permissions_for(me)
+            ok = perms.send_messages and perms.embed_links and perms.attach_files
+            lines.append(f"{'✅' if ok else '❌'} Целевой {tgt.mention}: писать/встраивать "
+                         f"{'могу' if ok else 'НЕ могу'}")
+
+    # тест переводчика
+    if http_session is None or http_session.closed:
+        http_session = aiohttp.ClientSession()
+    test, ok = await translate_text("Hello, this is a test message.")
+    if ok and test.lower() != "hello, this is a test message.":
+        lines.append(f"✅ Переводчик работает: «{test}»")
+    else:
+        lines.append("❌ Переводчик не отвечает — переводы пойдут в оригинале.")
 
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
-@tree.command(name="translate", description="Перевести текст EN→RU (тест переводчика)")
-@app_commands.describe(text="Текст для перевода")
-async def translate_cmd(interaction: discord.Interaction, text: str):
-    if is_mostly_russian(text):
-        await interaction.response.send_message("ℹ️ Текст уже на русском.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    await interaction.followup.send(safe_translate(text)[:2000], ephemeral=True)
 
-# ════════════════════════ СОБЫТИЯ ════════════════════════
-
-@bot.event
-async def on_ready():
-    log.info("Бот запущен: %s (id=%s)", bot.user, bot.user.id)
-    load_config()
-
-    try:
-        await tree.sync()
-        log.info("Слеш-команды синхронизированы (/bind, /check, /translate)")
-    except Exception:
-        log.exception("Не удалось синхронизировать команды")
-
-    # Выдаём высшую админку владельцу
-    for guild in bot.guilds:
-        try:
-            member = guild.get_member(OWNER_ID) or await guild.fetch_member(OWNER_ID)
-            role = discord.utils.get(guild.roles, name=ADMIN_ROLE_NAME)
-            if role is None:
-                role = await guild.create_role(
-                    name=ADMIN_ROLE_NAME,
-                    permissions=discord.Permissions.all(),
-                    color=discord.Color.red(),
-                    reason="Высшая админка владельца бота")
-            if role not in member.roles:
-                await member.add_roles(role, reason="Выдача высшей админки владельцу")
-                log.info("Роль «%s» выдана на сервере %s", ADMIN_ROLE_NAME, guild.name)
-        except discord.Forbidden:
-            log.warning("Не могу выдать роль на %s — подними роль бота выше «%s» "
-                        "в списке ролей сервера.", guild.name, ADMIN_ROLE_NAME)
-        except discord.NotFound:
-            log.info("Владелец (ID %s) не найден на сервере %s", OWNER_ID, guild.name)
-        except Exception:
-            log.exception("Ошибка выдачи роли на %s", guild.name)
-
-    log.info("Источник: %s | Приёмник: %s",
-             f"#{bot.get_channel(config['source_id'])}" if config["source_id"]
-             else "❌ не привязан — /bind",
-             f"#{bot.get_channel(config['target_id'])}" if config["target_id"]
-             else "❌ не привязан — /bind")
-
-@bot.event
-async def on_message(message: discord.Message):
-    # Вебхуки НЕ игнорируем — новости приходят именно от них.
-    if message.author.id == bot.user.id:
-        return
-    if message.channel.id != config["source_id"]:
-        return
-    try:
-        await process_news(message)
-    except Exception:
-        log.exception("Ошибка при обработке сообщения (id=%s)", message.id)
-
-# ════════════════════════ ЗАПУСК ════════════════════════
+# ---------------- Запуск ----------------
 
 if __name__ == "__main__":
-    load_config()
-    if not TOKEN:
-        log.error("Токен не задан! Укажи переменную окружения DISCORD_TOKEN на хостинге.")
-    else:
-        bot.run(TOKEN)
+    if not DISCORD_TOKEN:
+        print("❌ Переменная окружения DISCORD_TOKEN не задана!")
+    client.run(DISCORD_TOKEN)
