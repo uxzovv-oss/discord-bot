@@ -16,7 +16,8 @@ import json
 import logging
 import os
 import time
-
+import deep_translator
+print("✅ deep_translator найден:", deep_translator.__version__)
 import discord
 from discord import app_commands
 from deep_translator import GoogleTranslator
