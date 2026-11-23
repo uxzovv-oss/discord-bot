@@ -1,5 +1,6 @@
 import os
 import discord
+from discord import app_commands
 import aiohttp
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -10,7 +11,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = discord.Client(intents=intents)
-tree = discord.app_commands.CommandTree(bot)
+tree = app_commands.CommandTree(bot)
 
 # Привязки каналов: guild_id -> {"source": id, "target": id}
 bindings = {}
@@ -38,7 +39,7 @@ async def google_translate(text: str, dest: str = "ru"):
 
 
 def chunk_text(text, limit=1900):
-    """Режет длинный текст на части, чтобы Discord не ругался на лимит 2000 символов."""
+    """Режет длинный текст на части под лимит Discord 2000 символов."""
     parts = []
     while len(text) > limit:
         cut = text.rfind(" ", 0, limit)
@@ -186,7 +187,7 @@ async def on_message(message: discord.Message):
     if not b or message.channel.id != b["source"]:
         return
 
-    # обычных ботов игнорируем, а сообщения вебхуков и подписок — обрабатываем
+    # вебхуки и подписки обрабатываем, обычных ботов — игнорируем
     if message.author.bot and message.webhook_id is None:
         return
 
