@@ -1,4 +1,5 @@
 import os
+import io
 import discord
 from discord import app_commands
 import aiohttp
@@ -16,28 +17,62 @@ tree = app_commands.CommandTree(bot)
 # Привязки каналов: guild_id -> {"source": id, "target": id}
 bindings = {}
 
-TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
+GOOGLE_URL = "https://translate.googleapis.com/translate_a/single"
+MYMEMORY_URL = "https://api.mymemory.translated.net/get"
 
-MAX_FILE_SIZE = 8 * 1024 * 1024  # 8 МБ — больше Discord у обычных ботов не примет
+MAX_FILE_SIZE = 8 * 1024 * 1024  # 8 МБ — лимит Discord для обычных ботов
 
 
 async def google_translate(text: str, dest: str = "ru"):
-    """Перевод через бесплатный эндпоинт Google. Возвращает None, если сервис недоступен."""
+    """Перевод через Google с двумя попытками. Возвращает None, если не вышло."""
     if not text or not text.strip():
         return None
+
     params = {"client": "gtx", "sl": "auto", "tl": dest, "dt": "t", "q": text}
-    timeout = aiohttp.ClientTimeout(total=10)
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    for attempt in range(2):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(GOOGLE_URL, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        result = "".join(part[0] for part in data[0] if part and part[0])
+                        if result.strip():
+                            return result
+        except Exception as err:
+            print(f"⚠️ Google (попытка {attempt + 1}): {err}")
+    return None
+
+
+async def mymemory_translate(text: str, dest: str = "ru"):
+    """Запасной переводчик MyMemory (без ключей). Возвращает None, если не вышло."""
+    if not text or not text.strip():
+        return None
+
+    # MyMemory не определяет язык сам — считаем, что исходник английский
+    params = {"q": text, "langpair": f"en|{dest}"}
+    timeout = aiohttp.ClientTimeout(total=15)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(TRANSLATE_URL, params=params) as resp:
+            async with session.get(MYMEMORY_URL, params=params) as resp:
                 if resp.status != 200:
                     return None
                 data = await resp.json()
-        result = "".join(part[0] for part in data[0] if part and part[0])
-        return result if result.strip() else None
+        return data.get("responseData", {}).get("translatedText") or None
     except Exception as err:
-        print(f"⚠️ Ошибка перевода: {err}")
+        print(f"⚠️ MyMemory: {err}")
         return None
+
+
+async def translate_text(text: str, dest: str = "ru"):
+    """Главный переводчик: сначала Google, если не ответил — MyMemory."""
+    if not text or not text.strip():
+        return None
+    result = await google_translate(text, dest)
+    if result is None:
+        result = await mymemory_translate(text, dest)
+    return result
 
 
 async def download_file(url: str):
@@ -52,7 +87,7 @@ async def download_file(url: str):
         if len(data) > MAX_FILE_SIZE:
             return None
         filename = url.split("/")[-1].split("?")[0] or "file.png"
-        return discord.File(io_bytes := __import__("io").BytesIO(data), filename=filename)
+        return discord.File(io.BytesIO(data), filename=filename)
     except Exception as err:
         print(f"⚠️ Не удалось скачать файл {url}: {err}")
         return None
@@ -169,11 +204,11 @@ async def check(interaction: discord.Interaction):
                 f"писать={perms.send_messages}, embeds={perms.embed_links}, файлы={perms.attach_files}"
             )
 
-    test = await google_translate("hello")
+    test = await translate_text("hello")
     if test and test.strip().lower() != "hello":
         lines.append(f"✅ Переводчик работает: hello → {test}")
     else:
-        lines.append("❌ Переводчик недоступен — переводы пойдут в оригинале")
+        lines.append("❌ Переводчик недоступен — новости будут уходить в оригинале")
 
     await interaction.followup.send("\n".join(lines))
 
@@ -184,9 +219,9 @@ async def check(interaction: discord.Interaction):
 @app_commands.describe(text="Текст для перевода")
 async def translate(interaction: discord.Interaction, text: str):
     await interaction.response.defer(ephemeral=True)
-    result = await google_translate(text)
+    result = await translate_text(text)
     if result is None:
-        await interaction.followup.send("❌ Переводчик недоступен")
+        await interaction.followup.send("❌ Переводчик недоступен — оба сервиса не ответили")
     else:
         await interaction.followup.send(
             f"**Оригинал:**\n{text[:1500]}\n\n**Перевод:**\n{result[:1500]}"
@@ -220,25 +255,24 @@ async def on_message(message: discord.Message):
     text = message.content or ""
     translated = None
     if text.strip():
-        translated = await google_translate(text)
+        translated = await translate_text(text)
         if translated is None:
-            print("⚠️ Переводчик недоступен — отправляю оригинал")
-            translated = text
+            print("⚠️ Переводчик недоступен — отправляю оригинал с пометкой")
 
     # переводим embed-карточки
     new_embeds = []
     for e in message.embeds[:10]:
         ne = discord.Embed()
         if e.title:
-            ne.title = await google_translate(e.title) or e.title
+            ne.title = await translate_text(e.title) or e.title
         if e.description:
-            ne.description = await google_translate(e.description) or e.description
+            ne.description = await translate_text(e.description) or e.description
         for f in e.fields[:10]:
-            name = await google_translate(f.name) or f.name
-            value = await google_translate(f.value) or f.value
+            name = await translate_text(f.name) or f.name
+            value = await translate_text(f.value) or f.value
             ne.add_field(name=name, value=value, inline=f.inline)
         if e.footer and e.footer.text:
-            ne.set_footer(text=await google_translate(e.footer.text) or e.footer.text)
+            ne.set_footer(text=await translate_text(e.footer.text) or e.footer.text)
         if e.image and e.image.url:
             ne.set_image(url=e.image.url)
         if e.thumbnail and e.thumbnail.url:
@@ -263,6 +297,13 @@ async def on_message(message: discord.Message):
         if translated:
             parts = chunk_text(translated)
             # первую часть отправляем вместе с файлами — так Discord покажет картинки
+            first = parts.pop(0)
+            await target.send(content=first, files=files or None)
+            for part in parts:
+                await target.send(content=part)
+        elif text.strip():
+            # перевод не удался — отправляем оригинал с честной пометкой
+            parts = chunk_text("🌐 *(переводчик временно недоступен)*\n" + text)
             first = parts.pop(0)
             await target.send(content=first, files=files or None)
             for part in parts:
