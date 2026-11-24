@@ -21,6 +21,30 @@ GOOGLE_URL = "https://translate.googleapis.com/translate_a/single"
 MYMEMORY_URL = "https://api.mymemory.translated.net/get"
 
 MAX_FILE_SIZE = 8 * 1024 * 1024  # 8 МБ — лимит Discord для обычных ботов
+TRANSLATE_CHUNK = 450  # лимит Google — 500 символов, берём с запасом
+
+
+def split_for_translation(text, limit=TRANSLATE_CHUNK):
+    """Режет текст на куски не длиннее limit, не рвя слова посередине."""
+    parts = []
+    while len(text) > limit:
+        cut = text.rfind(" ", 0, limit)
+        if cut == -1 or cut < limit // 2:
+            cut = limit
+        parts.append(text[:cut])
+        text = text[cut:].lstrip()
+    if text:
+        parts.append(text)
+    return parts
+
+
+def is_bad_translation(result: str) -> bool:
+    """Отсеивает ответы сервисов-заглушки вроде 'QUERY LENGTH LIMIT EXCEEDED'."""
+    if not result:
+        return True
+    bad_markers = ("QUERY LENGTH", "LIMIT EXCEEDED", "MYMEMORY WARNING")
+    upper = result.upper()
+    return any(marker in upper for marker in bad_markers)
 
 
 async def google_translate(text: str, dest: str = "ru"):
@@ -38,7 +62,7 @@ async def google_translate(text: str, dest: str = "ru"):
                     if resp.status == 200:
                         data = await resp.json()
                         result = "".join(part[0] for part in data[0] if part and part[0])
-                        if result.strip():
+                        if result.strip() and not is_bad_translation(result):
                             return result
         except Exception as err:
             print(f"⚠️ Google (попытка {attempt + 1}): {err}")
@@ -46,33 +70,45 @@ async def google_translate(text: str, dest: str = "ru"):
 
 
 async def mymemory_translate(text: str, dest: str = "ru"):
-    """Запасной переводчик MyMemory (без ключей). Возвращает None, если не вышло."""
+    """Запасной переводчик MyMemory (тоже кусками — у него лимит 500 байт на запрос)."""
     if not text or not text.strip():
         return None
 
-    # MyMemory не определяет язык сам — считаем, что исходник английский
-    params = {"q": text, "langpair": f"en|{dest}"}
-    timeout = aiohttp.ClientTimeout(total=15)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(MYMEMORY_URL, params=params) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-        return data.get("responseData", {}).get("translatedText") or None
-    except Exception as err:
-        print(f"⚠️ MyMemory: {err}")
-        return None
+    results = []
+    for chunk in split_for_translation(text, 450):
+        params = {"q": chunk, "langpair": f"en|{dest}"}
+        timeout = aiohttp.ClientTimeout(total=15)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(MYMEMORY_URL, params=params) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+            piece = data.get("responseData", {}).get("translatedText")
+            if not piece or is_bad_translation(piece):
+                return None
+            results.append(piece)
+        except Exception as err:
+            print(f"⚠️ MyMemory: {err}")
+            return None
+    return " ".join(results)
 
 
 async def translate_text(text: str, dest: str = "ru"):
-    """Главный переводчик: сначала Google, если не ответил — MyMemory."""
+    """Главный переводчик: Google, затем MyMemory. Длинные тексты переводятся кусками."""
     if not text or not text.strip():
         return None
-    result = await google_translate(text, dest)
-    if result is None:
-        result = await mymemory_translate(text, dest)
-    return result
+
+    pieces = split_for_translation(text)
+    translated_parts = []
+    for chunk in pieces:
+        result = await google_translate(chunk, dest)
+        if result is None:
+            result = await mymemory_translate(chunk, dest)
+        if result is None:
+            return None  # хоть один кусок не перевёлся — перевод сорван
+        translated_parts.append(result)
+    return " ".join(translated_parts).strip()
 
 
 async def download_file(url: str):
@@ -105,6 +141,26 @@ def chunk_text(text, limit=1900):
     if text:
         parts.append(text)
     return parts
+
+
+def extract_message_payload(message: discord.Message):
+    """Достаёт текст, эмбеды и вложения — в том числе из пересланных сообщений.
+    Возвращает (текст, список эмбедов, список вложений)."""
+    text = message.content or ""
+    embeds = list(message.embeds)
+    attachments = list(message.attachments)
+
+    # Пересланные сообщения (forward): контент лежит в message_snapshots
+    if message.message_snapshots:
+        snap = message.message_snapshots[0].message
+        if not text.strip():
+            text = snap.content or ""
+        if not embeds:
+            embeds = list(snap.embeds)
+        if not attachments:
+            attachments = list(snap.attachments)
+
+    return text, embeds, attachments
 
 
 # ---------- /bind ----------
@@ -204,9 +260,10 @@ async def check(interaction: discord.Interaction):
                 f"писать={perms.send_messages}, embeds={perms.embed_links}, файлы={perms.attach_files}"
             )
 
-    test = await translate_text("hello")
-    if test and test.strip().lower() != "hello":
-        lines.append(f"✅ Переводчик работает: hello → {test}")
+    long_test = "hello world. " * 40  # 520 символов — проверяем обход лимита 500
+    test = await translate_text(long_test)
+    if test and test.strip().lower() != long_test.strip().lower():
+        lines.append("✅ Переводчик работает (в том числе с длинными текстами)")
     else:
         lines.append("❌ Переводчик недоступен — новости будут уходить в оригинале")
 
@@ -251,8 +308,10 @@ async def on_message(message: discord.Message):
         print(f"⚠️ Target-канал {b['target']} не найден")
         return
 
+    # достаём контент (включая пересланные сообщения)
+    text, embeds, attachments = extract_message_payload(message)
+
     # переводим текст
-    text = message.content or ""
     translated = None
     if text.strip():
         translated = await translate_text(text)
@@ -261,7 +320,7 @@ async def on_message(message: discord.Message):
 
     # переводим embed-карточки
     new_embeds = []
-    for e in message.embeds[:10]:
+    for e in embeds[:10]:
         ne = discord.Embed()
         if e.title:
             ne.title = await translate_text(e.title) or e.title
@@ -283,10 +342,10 @@ async def on_message(message: discord.Message):
             ne.color = e.color
         new_embeds.append(ne)
 
-    # скачиваем картинки и файлы из source, чтобы отправить их в target по-настоящему
+    # скачиваем картинки и файлы, чтобы отправить их в target по-настоящему
     files = []
     failed_urls = []
-    for att in message.attachments[:5]:
+    for att in attachments[:5]:
         f = await download_file(att.url)
         if f is not None:
             files.append(f)
@@ -296,7 +355,6 @@ async def on_message(message: discord.Message):
     try:
         if translated:
             parts = chunk_text(translated)
-            # первую часть отправляем вместе с файлами — так Discord покажет картинки
             first = parts.pop(0)
             await target.send(content=first, files=files or None)
             for part in parts:
