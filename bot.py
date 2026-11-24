@@ -8,21 +8,20 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
     raise SystemExit("❌ Не найдена переменная окружения DISCORD_TOKEN")
 
-# ============================================================
-#  ДОСТУП: команды работают ТОЛЬКО у тех, чей ID вписан ниже.
-#  Достать ID: Настройки Discord -> Расширенные -> Режим разработчика,
-#  потом ПКМ по юзеру -> Копировать ID пользователя.
-# ============================================================
+# ============ ДОСТУП ============
+# Впиши сюда Discord ID тех, кто может пользоваться командами бота.
+# ID достаётся так: Настройки Discord -> Расширенные -> Режим разработчика,
+# потом ПКМ по юзеру -> Копировать ID.
 ALLOWED_USER_IDS = [
-    123456789012345678,  # <- ЗАМЕНИ на свой ID
-    # 987654321098765432,  # <- второй админ, если нужен
+    123456789012345678,  # <- замени на свой ID
+    # 987654321098765432,  # <- второй человек, если нужен
 ]
 
-# Роль, которая тоже даёт доступ (не требует админки!)
+# Название роли, которая тоже даёт доступ
 ROLE_NAME = "not-bot"
 
-# Имя, от которого вебхук шлёт сообщения по умолчанию
-DEFAULT_WEBHOOK_NAME = "Bodycam News Bot"
+# Как бот будет подписывать сообщения в вебхуке
+WEBHOOK_NAME = "Bodycam News Bot"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -33,31 +32,26 @@ tree = app_commands.CommandTree(bot)
 # Привязки каналов: guild_id -> {"source": id, "target": id}
 bindings = {}
 
+# Кэш вебхуков: channel_id -> discord.Webhook
+webhooks = {}
+
 GOOGLE_URL = "https://translate.googleapis.com/translate_a/single"
 MYMEMORY_URL = "https://api.mymemory.translated.net/get"
 
-MAX_FILE_SIZE = 8 * 1024 * 1024
-TRANSLATE_CHUNK = 450
+MAX_FILE_SIZE = 8 * 1024 * 1024  # 8 МБ — лимит Discord для обычных ботов
+TRANSLATE_CHUNK = 450  # лимит Google — 500 символов, берём с запасом
 
 
 def has_access(interaction: discord.Interaction) -> bool:
-    """Жёсткая проверка доступа: только ID из списка или роль not-bot."""
+    """Проверяет доступ: по списку ID или по роли not-bot."""
     if interaction.user.id in ALLOWED_USER_IDS:
         return True
-    roles = getattr(interaction.user, "roles", [])
-    return any(role.name.lower() == ROLE_NAME.lower() for role in roles)
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if member and member.get_role(discord.utils.find(
+            lambda r: r.name == ROLE_NAME, [r for r in getattr(member, "roles", [])])):
+        return True
+    return False
 
-
-async def access_denied(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "⛔ Нет доступа к командам бота.",
-        ephemeral=True,
-    )
-
-
-# ============================================================
-#  ПЕРЕВОДЧИК
-# ============================================================
 
 def split_for_translation(text, limit=TRANSLATE_CHUNK):
     """Режет текст на куски не длиннее limit, не рвя слова посередине."""
@@ -83,18 +77,20 @@ def is_bad_translation(result: str) -> bool:
 
 
 async def google_translate(text: str, dest: str = "ru"):
-    """Перевод через Google с двумя попытками. None — если не вышло."""
+    """Перевод через Google с двумя попытками. Возвращает None, если не вышло."""
     if not text or not text.strip():
         return None
+
     params = {"client": "gtx", "sl": "auto", "tl": dest, "dt": "t", "q": text}
     timeout = aiohttp.ClientTimeout(total=15)
+
     for attempt in range(2):
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(GOOGLE_URL, params=params) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        result = "".join(p[0] for p in data[0] if p and p[0])
+                        result = "".join(part[0] for part in data[0] if part and part[0])
                         if result.strip() and not is_bad_translation(result):
                             return result
         except Exception as err:
@@ -103,9 +99,10 @@ async def google_translate(text: str, dest: str = "ru"):
 
 
 async def mymemory_translate(text: str, dest: str = "ru"):
-    """Запасной переводчик MyMemory."""
+    """Запасной переводчик MyMemory (тоже кусками)."""
     if not text or not text.strip():
         return None
+
     results = []
     for chunk in split_for_translation(text, 450):
         params = {"q": chunk, "langpair": f"en|{dest}"}
@@ -127,9 +124,10 @@ async def mymemory_translate(text: str, dest: str = "ru"):
 
 
 async def translate_text(text: str, dest: str = "ru"):
-    """Google -> MyMemory, длинные тексты — кусками."""
+    """Главный переводчик: Google, затем MyMemory. Длинные тексты — кусками."""
     if not text or not text.strip():
         return None
+
     pieces = split_for_translation(text)
     translated_parts = []
     for chunk in pieces:
@@ -161,7 +159,7 @@ async def download_file(url: str):
 
 
 def chunk_text(text, limit=1900):
-    """Режет длинный текст под лимит Discord 2000 символов."""
+    """Режет длинный текст на части под лимит Discord 2000 символов."""
     parts = []
     while len(text) > limit:
         cut = text.rfind(" ", 0, limit)
@@ -192,17 +190,13 @@ def extract_message_payload(message: discord.Message):
     return text, embeds, attachments
 
 
-# ============================================================
-#  ВЕБХУКИ
-# ============================================================
-
 async def get_webhook(channel: discord.TextChannel):
-    """Находит вебхук бота в канале или создаёт новый. None — если прав нет."""
+    """Находит вебхук бота в канале (или создаёт его). None — если прав нет."""
     try:
         for wh in await channel.webhooks():
             if wh.user == bot.user:
                 return wh
-        return await channel.create_webhook(name=DEFAULT_WEBHOOK_NAME)
+        return await channel.create_webhook(name=WEBHOOK_NAME)
     except discord.Forbidden:
         print(f"❌ Нет прав создавать вебхук в #{channel.name}")
         return None
@@ -211,17 +205,18 @@ async def get_webhook(channel: discord.TextChannel):
         return None
 
 
-async def send_as_webhook(channel, content=None, files=None, embeds=None,
-                          username=DEFAULT_WEBHOOK_NAME, avatar_url=None):
-    """Шлёт сообщение через вебхук от имени бота. Если вебхук недоступен — обычным способом."""
-    wh = await get_webhook(channel)
+async def send_as_bot(channel: discord.TextChannel, content=None, files=None, embeds=None):
+    """Отправляет сообщение через вебхук — с именем и аватаркой бота.
+    Если вебхук недоступен, отправляет обычным способом."""
+    avatar_url = bot.user.display_avatar.url if bot.user else None
+    wh = get_webhook.__wrapped__(channel) if False else await get_webhook(channel)
     try:
         if wh is not None:
             await wh.send(
                 content=content,
                 files=files,
                 embeds=embeds,
-                username=username,
+                username=WEBHOOK_NAME,
                 avatar_url=avatar_url,
             )
         else:
@@ -230,137 +225,7 @@ async def send_as_webhook(channel, content=None, files=None, embeds=None,
         raise
 
 
-# ============================================================
-#  КОМАНДА /SAY — отправка сообщения вебхуком в выбранный канал
-# ============================================================
-
-class SayChannelSelect(discord.ui.ChannelSelect):
-    def __init__(self):
-        super().__init__(
-            placeholder="Куда отправить сообщение",
-            channel_types=[discord.ChannelType.text],
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        channel = self.values[0]
-        await interaction.response.send_modal(SayModal(channel))
-
-
-class SayModal(discord.ui.Modal, title="Сообщение от имени бота"):
-    author_name = discord.ui.TextInput(
-        label="Имя отправителя (как будет видно в канале)",
-        placeholder=f"Например: {DEFAULT_WEBHOOK_NAME}",
-        default=DEFAULT_WEBHOOK_NAME,
-        required=False,
-        max_length=60,
-    )
-    avatar_url = discord.ui.TextInput(
-        label="Ссылка на аватарку (необязательно)",
-        placeholder="https://... (прямая ссылка на картинку)",
-        required=False,
-        max_length=300,
-    )
-    embed_title = discord.ui.TextInput(
-        label="Заголовок (тема)",
-        placeholder="Например: 📢 Новый патч Bodycam!",
-        required=False,
-        max_length=256,
-    )
-    message_text = discord.ui.TextInput(
-        label="Текст сообщения",
-        style=discord.TextStyle.long,
-        placeholder="Что написать в канал...",
-        required=True,
-        max_length=1800,
-    )
-    embed_color = discord.ui.TextInput(
-        label="Цвет полосы (HEX)",
-        placeholder="Например: #FF5500 или red / green / blue",
-        default="#FF5500",
-        required=False,
-        max_length=20,
-    )
-
-    def __init__(self, channel: discord.TextChannel):
-        super().__init__()
-        self.channel = channel
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
-        # разбираем цвет
-        color = discord.Color.orange()
-        raw = self.embed_color.value.strip()
-        color_map = {
-            "red": discord.Color.red(),
-            "green": discord.Color.green(),
-            "blue": discord.Color.blue(),
-            "yellow": discord.Color.gold(),
-            "purple": discord.Color.purple(),
-            "orange": discord.Color.orange(),
-            "pink": discord.Color.magenta(),
-            "black": discord.Color.dark_grey(),
-        }
-        if raw.lower() in color_map:
-            color = color_map[raw.lower()]
-        elif raw.startswith("#") and len(raw) == 7:
-            try:
-                color = discord.Color(int(raw[1:], 16))
-            except ValueError:
-                pass
-
-        embed = discord.Embed(
-            title=self.embed_title.value or None,
-            description=self.message_text.value,
-            color=color,
-        )
-        embed.set_footer(text=f"Отправлено: {interaction.user.display_name}")
-
-        username = self.author_name.value.strip() or DEFAULT_WEBHOOK_NAME
-        avatar = self.avatar_url.value.strip() or None
-
-        try:
-            await send_as_webhook(
-                self.channel,
-                embeds=[embed],
-                username=username,
-                avatar_url=avatar,
-            )
-            await interaction.followup.send(
-                f"✅ Сообщение отправлено в <#{self.channel.id}> от имени **{username}**"
-            )
-        except discord.Forbidden:
-            await interaction.followup.send(
-                f"❌ Нет прав писать в <#{self.channel.id}>"
-            )
-        except Exception as err:
-            await interaction.followup.send(f"❌ Ошибка отправки: {err}")
-
-
-class SayView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=180)
-        self.add_item(SayChannelSelect())
-
-
-@tree.command(
-    name="say",
-    description="Отправить сообщение вебхуком в выбранный канал (только для админов)",
-)
-async def say(interaction: discord.Interaction):
-    if not has_access(interaction):
-        await access_denied(interaction)
-        return
-    await interaction.response.send_message(
-        "Выбери канал, куда отправить сообщение:",
-        view=SayView(),
-        ephemeral=True,
-    )
-
-
-# ============================================================
-#  КОМАНДА /BIND — привязка source и target
-# ============================================================
+# ---------- /bind ----------
 
 class TargetSelect(discord.ui.ChannelSelect):
     def __init__(self, view):
@@ -416,7 +281,7 @@ class BindView(discord.ui.View):
 @tree.command(name="bind", description="Привязать каналы: source (оригиналы) и target (переводы)")
 async def bind(interaction: discord.Interaction):
     if not has_access(interaction):
-        await access_denied(interaction)
+        await interaction.response.send_message("⛔ Нет доступа к командам бота.", ephemeral=True)
         return
     await interaction.response.send_message(
         "Выбери канал-источник (куда падают оригиналы новостей):",
@@ -425,18 +290,16 @@ async def bind(interaction: discord.Interaction):
     )
 
 
-# ============================================================
-#  КОМАНДА /CHECK
-# ============================================================
+# ---------- /check ----------
 
 @tree.command(name="check", description="Проверить бота, каналы, права и переводчик")
 async def check(interaction: discord.Interaction):
     if not has_access(interaction):
-        await access_denied(interaction)
+        await interaction.response.send_message("⛔ Нет доступа к командам бота.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     lines = ["✅ Бот работает"]
-    lines.append(f"✅ Доступ есть: твой ID в списке или у тебя роль `{ROLE_NAME}`")
+    lines.append(f"✅ Доступ: ты в списке разрешённых или у тебя есть роль `{ROLE_NAME}`")
 
     b = bindings.get(interaction.guild_id)
     if not b:
@@ -451,7 +314,10 @@ async def check(interaction: discord.Interaction):
         else:
             perms = source.permissions_for(me)
             ok = perms.read_messages and perms.read_message_history
-            lines.append(f"{'✅' if ok else '❌'} Source <#{source.id}>: читать={perms.read_messages}")
+            lines.append(
+                f"{'✅' if ok else '❌'} Source <#{source.id}>: "
+                f"читать={perms.read_messages}"
+            )
 
         if target is None:
             lines.append("❌ Target: канал не найден, сделай /bind заново")
@@ -462,7 +328,7 @@ async def check(interaction: discord.Interaction):
                 f"{'✅' if wh_ok else '❌'} Target <#{target.id}>: вебхуки={wh_ok}, писать={perms.send_messages}"
             )
 
-    long_test = "hello world. " * 40
+    long_test = "hello world. " * 40  # 520 символов — проверяем обход лимита 500
     test = await translate_text(long_test)
     if test and test.strip().lower() != long_test.strip().lower():
         lines.append("✅ Переводчик работает (в том числе с длинными текстами)")
@@ -472,15 +338,13 @@ async def check(interaction: discord.Interaction):
     await interaction.followup.send("\n".join(lines))
 
 
-# ============================================================
-#  КОМАНДА /TRANSLATE
-# ============================================================
+# ---------- /translate ----------
 
 @tree.command(name="translate", description="Перевести текст на русский")
 @app_commands.describe(text="Текст для перевода")
 async def translate(interaction: discord.Interaction, text: str):
     if not has_access(interaction):
-        await access_denied(interaction)
+        await interaction.response.send_message("⛔ Нет доступа к командам бота.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     result = await translate_text(text)
@@ -492,9 +356,7 @@ async def translate(interaction: discord.Interaction, text: str):
         )
 
 
-# ============================================================
-#  ПРИЁМ НОВОСТЕЙ (source -> target)
-# ============================================================
+# ---------- Приём новостей ----------
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -518,12 +380,14 @@ async def on_message(message: discord.Message):
 
     text, embeds, attachments = extract_message_payload(message)
 
+    # переводим текст
     translated = None
     if text.strip():
         translated = await translate_text(text)
         if translated is None:
             print("⚠️ Переводчик недоступен — отправляю оригинал с пометкой")
 
+    # переводим embed-карточки
     new_embeds = []
     for e in embeds[:10]:
         ne = discord.Embed()
@@ -547,6 +411,7 @@ async def on_message(message: discord.Message):
             ne.color = e.color
         new_embeds.append(ne)
 
+    # скачиваем картинки и файлы
     files = []
     failed_urls = []
     for att in attachments[:5]:
@@ -560,21 +425,21 @@ async def on_message(message: discord.Message):
         if translated:
             parts = chunk_text(translated)
             first = parts.pop(0)
-            await send_as_webhook(target, content=first, files=files or None)
+            await send_as_bot(target, content=first, files=files or None)
             for part in parts:
-                await send_as_webhook(target, content=part)
+                await send_as_bot(target, content=part)
         elif text.strip():
             parts = chunk_text("🌐 *(переводчик временно недоступен)*\n" + text)
             first = parts.pop(0)
-            await send_as_webhook(target, content=first, files=files or None)
+            await send_as_bot(target, content=first, files=files or None)
             for part in parts:
-                await send_as_webhook(target, content=part)
+                await send_as_bot(target, content=part)
         elif files:
-            await send_as_webhook(target, files=files)
+            await send_as_bot(target, files=files)
         if new_embeds:
-            await send_as_webhook(target, embeds=new_embeds)
+            await send_as_bot(target, embeds=new_embeds)
         if failed_urls:
-            await send_as_webhook(target, content="📎 " + "\n".join(failed_urls))
+            await send_as_bot(target, content="📎 " + "\n".join(failed_urls))
     except discord.Forbidden:
         print(f"❌ Нет прав писать в канал #{target.name}")
     except Exception as err:
